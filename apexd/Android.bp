@@ -50,6 +50,7 @@ cc_defaults {
         "-Wall",
         "-Wextra",
         "-Werror",
+        "-Wno-unused-function",
         "-Wno-unused-parameter",
 
         // Some extra flags.
@@ -62,7 +63,6 @@ cc_defaults {
         "-Wunreachable-code",
         "-Wunreachable-code-break",
         "-Wunreachable-code-return",
-        "-Wunused",
         "-Wused-but-marked-unused",
     ] + select(release_flag("RELEASE_AVF_ENABLE_EARLY_VM"), {
         true: ["-DRELEASE_AVF_ENABLE_EARLY_VM"],
