@@ -32,8 +32,10 @@
 #include <linux/loop.h>
 #include <string>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -67,6 +69,8 @@ namespace loop {
 // 128 kB read-ahead, which we currently use for /system as well
 static constexpr const unsigned int kReadAheadKb = 128;
 
+static int sysfs_mntfd = -1;
+
 void LoopbackDeviceUniqueFd::MaybeCloseBad() {
   if (device_fd.get() != -1) {
     // Disassociate any files.
@@ -76,19 +80,49 @@ void LoopbackDeviceUniqueFd::MaybeCloseBad() {
   }
 }
 
+static void OpenSysfsMount() {
+  int fsfd;
+
+  if ((fsfd = syscall(__NR_fsopen, "sysfs", FSOPEN_CLOEXEC)) == -1) {
+    PLOG(FATAL) << "Failed to create sysfs mount context";
+  }
+
+  syscall(__NR_fsconfig, fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0);
+
+  if ((sysfs_mntfd = syscall(__NR_fsmount, fsfd, FSMOUNT_CLOEXEC, 0)) == -1) {
+    PLOG(FATAL) << "Failed to initialize sysfs mount";
+  }
+
+  // Remount sysfs in read-write mode
+  if (close(fsfd), (fsfd = syscall(__NR_fspick, sysfs_mntfd, "", FSPICK_EMPTY_PATH)) == -1) {
+    PLOG(FATAL) << "Failed to reconfigure sysfs mount";
+  }
+
+  syscall(__NR_fsconfig, fsfd, FSCONFIG_SET_FLAG, "rw", NULL, 0);
+  syscall(__NR_fsconfig, fsfd, FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0);
+  close(fsfd);
+}
+
+static bool ReadFileAtDirToString(borrowed_fd dirfd, const std::string& path, std::string* content) {
+  unique_fd fd(openat(dirfd.get(), path.c_str(), O_RDONLY | O_CLOEXEC));
+  return ReadFdToString(fd, content);
+}
+
 Result<void> ConfigureScheduler(const std::string& device_path) {
   ATRACE_NAME("ConfigureScheduler");
   if (!StartsWith(device_path, "/dev/")) {
     return Error() << "Invalid argument " << device_path;
   }
 
+  if (sysfs_mntfd == -1) OpenSysfsMount();
+
   const std::string device_name = Basename(device_path);
 
   const std::string sysfs_path =
-      StringPrintf("/sys/block/%s/queue/scheduler", device_name.c_str());
-  unique_fd sysfs_fd(open(sysfs_path.c_str(), O_RDWR | O_CLOEXEC));
+      StringPrintf("block/%s/queue/scheduler", device_name.c_str());
+  unique_fd sysfs_fd(openat(sysfs_mntfd, sysfs_path.c_str(), O_RDWR | O_CLOEXEC));
   if (sysfs_fd.get() == -1) {
-    return ErrnoError() << "Failed to open " << sysfs_path;
+    return ErrnoError() << "Failed to open " << "/sys/" << sysfs_path;
   }
 
   // Kernels before v4.1 only support 'noop'. Kernels [v4.1, v5.0) support
@@ -98,8 +132,8 @@ Result<void> ConfigureScheduler(const std::string& device_path) {
 
   int ret = 0;
   std::string cur_sched_str;
-  if (!ReadFileToString(sysfs_path, &cur_sched_str)) {
-    return ErrnoError() << "Failed to read " << sysfs_path;
+  if (!ReadFileAtDirToString(sysfs_mntfd, sysfs_path, &cur_sched_str)) {
+    return ErrnoError() << "Failed to read " << "/sys/" << sysfs_path;
   }
   cur_sched_str = android::base::Trim(cur_sched_str);
   if (std::count(kNoScheduler.begin(), kNoScheduler.end(), cur_sched_str)) {
@@ -114,7 +148,7 @@ Result<void> ConfigureScheduler(const std::string& device_path) {
   }
 
   if (ret <= 0) {
-    return ErrnoError() << "Failed to write to " << sysfs_path;
+    return ErrnoError() << "Failed to write to " << "/sys/" << sysfs_path;
   }
 
   return {};
@@ -168,6 +202,7 @@ static Result<std::string> BlockdevName(dev_t dev) {
 // -> /dev/block/dm-1 (system_b; dm-linear)
 // -> /dev/sda26
 static Result<uint32_t> BlockDeviceQueueDepth(const std::string& file_path) {
+#if 0 // Disabled in Waydroid
   static std::unordered_map<std::string, uint32_t> cache;
   static std::mutex cache_mutex;
 
@@ -230,6 +265,9 @@ static Result<uint32_t> BlockDeviceQueueDepth(const std::string& file_path) {
     cache[blockdev] = result;
   }
   return result;
+#else
+  return Error() << "Disabled in Waydroid";
+#endif
 }
 
 // Set 'nr_requests' of `loop_device_path` equal to the queue depth of
@@ -237,6 +275,7 @@ static Result<uint32_t> BlockDeviceQueueDepth(const std::string& file_path) {
 Result<void> ConfigureQueueDepth(const std::string& loop_device_path,
                                  const std::string& file_path) {
   ATRACE_NAME("ConfigureQueueDepth");
+#if 0 // Disabled in Waydroid
   if (!StartsWith(loop_device_path, "/dev/")) {
     return Error() << "Invalid argument " << loop_device_path;
   }
@@ -274,19 +313,21 @@ Result<void> ConfigureQueueDepth(const std::string& loop_device_path,
       *qd < cur_nr_requests) {
     return ErrnoErrorf("Failed to write {} to {}", *qd, sysfs_path);
   }
+#endif
   return {};
 }
 
 Result<void> ConfigureReadAhead(const std::string& device_path) {
   ATRACE_NAME("ConfigureReadAhead");
   CHECK(StartsWith(device_path, "/dev/"));
+  if (sysfs_mntfd == -1) OpenSysfsMount();
   std::string device_name = Basename(device_path);
 
   std::string sysfs_device =
-      StringPrintf("/sys/block/%s/queue/read_ahead_kb", device_name.c_str());
-  unique_fd sysfs_fd(open(sysfs_device.c_str(), O_RDWR | O_CLOEXEC));
+      StringPrintf("block/%s/queue/read_ahead_kb", device_name.c_str());
+  unique_fd sysfs_fd(openat(sysfs_mntfd, sysfs_device.c_str(), O_RDWR | O_CLOEXEC));
   if (sysfs_fd.get() == -1) {
-    return ErrnoError() << "Failed to open " << sysfs_device;
+    return ErrnoError() << "Failed to open " << "/sys/" << sysfs_device;
   }
 
   std::string readAheadKb = std::to_string(
